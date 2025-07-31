@@ -3,6 +3,8 @@
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::ToSocketAddrs;
+#[cfg(unix)]
+use std::path::Path;
 
 use crate::request::{self, Request};
 use crate::response::{self, Response};
@@ -13,6 +15,8 @@ use bytes::{BufMut, BytesMut};
 #[cfg(unix)]
 use may::io::WaitIo;
 use may::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use may::os::unix::net::{UnixListener, UnixStream};
 use may::{coroutine, go};
 
 macro_rules! t_c {
@@ -62,6 +66,39 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
                     go!(
                         builder,
                         move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                            error!("service err = {e:?}");
+                            stream.shutdown(std::net::Shutdown::Both).ok();
+                        }
+                    )
+                    .unwrap();
+                }
+            }
+        )
+    }
+
+    /// Spawns the http service, binding to the given Unix Domain Socket path
+    /// return a coroutine that you can cancel it when need to stop the service
+    #[cfg(unix)]
+    fn start_with_uds<P: AsRef<Path>>(self, path: P) -> io::Result<coroutine::JoinHandle<()>> {
+        use std::fs;
+        use std::os::fd::AsRawFd;
+        
+        let path = path.as_ref();
+        // Remove existing socket file if it exists
+        let _ = fs::remove_file(path);
+        
+        let listener = UnixListener::bind(path)?;
+        go!(
+            coroutine::Builder::new().name("UdsServerFac".to_owned()),
+            move || {
+                for stream in listener.incoming() {
+                    let mut stream = t_c!(stream);
+                    let id = stream.as_raw_fd() as usize;
+                    let service = self.new_service(id);
+                    let builder = may::coroutine::Builder::new().id(id);
+                    go!(
+                        builder,
+                        move || if let Err(e) = each_connection_loop_uds(&mut stream, service) {
                             error!("service err = {e:?}");
                             stream.shutdown(std::net::Shutdown::Both).ok();
                         }
@@ -170,6 +207,43 @@ fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) 
     }
 }
 
+#[cfg(unix)]
+fn each_connection_loop_uds<T: HttpService>(stream: &mut UnixStream, mut service: T) -> io::Result<()> {
+    let mut req_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut body_buf = BytesMut::with_capacity(4096);
+
+    loop {
+        // Use the same non-blocking pattern as TCP since UnixStream exposes inner_mut()
+        let read_blocked = nonblock_read(stream.inner_mut(), &mut req_buf)?;
+
+        // prepare the requests, we should make sure the request is fully read
+        loop {
+            let mut headers = [MaybeUninit::uninit(); request::MAX_HEADERS];
+            let req = match request::decode(&mut headers, &mut req_buf, stream)? {
+                Some(req) => req,
+                None => break,
+            };
+            reserve_buf(&mut rsp_buf);
+            let mut rsp = Response::new(&mut body_buf);
+            match service.call(req, &mut rsp) {
+                Ok(()) => response::encode(rsp, &mut rsp_buf),
+                Err(e) => {
+                    eprintln!("service err = {e:?}");
+                    response::encode_error(e, &mut rsp_buf);
+                }
+            }
+        }
+
+        // write out the responses
+        nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+
+        if read_blocked {
+            stream.wait_io();
+        }
+    }
+}
+
 #[cfg(not(unix))]
 fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) -> io::Result<()> {
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
@@ -207,6 +281,7 @@ fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) 
 
         // send the result back to client
         stream.write_all(&rsp_buf)?;
+        rsp_buf.clear();
     }
 }
 
@@ -225,6 +300,36 @@ impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
                     let service = service.clone();
                     go!(
                         move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                            error!("service err = {e:?}");
+                            stream.shutdown(std::net::Shutdown::Both).ok();
+                        }
+                    );
+                }
+            }
+        )
+    }
+    
+    /// Spawns the http service, binding to the given Unix Domain Socket path
+    /// return a coroutine that you can cancel it when need to stop the service
+    #[cfg(unix)]
+    pub fn start_with_uds<P: AsRef<Path>>(self, path: P) -> io::Result<coroutine::JoinHandle<()>> {
+        use std::fs;
+        use std::os::fd::AsRawFd;
+        
+        let path = path.as_ref();
+        // Remove existing socket file if it exists
+        let _ = fs::remove_file(path);
+        
+        let listener = UnixListener::bind(path)?;
+        let service = self.0;
+        go!(
+            coroutine::Builder::new().name("UdsServer".to_owned()),
+            move || {
+                for stream in listener.incoming() {
+                    let mut stream = t_c!(stream);
+                    let service = service.clone();
+                    go!(
+                        move || if let Err(e) = each_connection_loop_uds(&mut stream, service) {
                             error!("service err = {e:?}");
                             stream.shutdown(std::net::Shutdown::Both).ok();
                         }
