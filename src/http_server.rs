@@ -12,8 +12,6 @@ use crate::response::{self, Response};
 #[cfg(unix)]
 use bytes::Buf;
 use bytes::{BufMut, BytesMut};
-#[cfg(unix)]
-use may::io::WaitIo;
 use may::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use may::os::unix::net::{UnixListener, UnixStream};
@@ -33,9 +31,9 @@ macro_rules! t_c {
 
 /// the http service trait
 /// user code should supply a type that impl the `call` method for the http server
-///
+/// S is the stream type (`TcpStream` or `UnixStream`)
 pub trait HttpService {
-    fn call(&mut self, req: Request, rsp: &mut Response) -> io::Result<()>;
+    fn call<S>(&mut self, req: Request<S>, rsp: &mut Response) -> io::Result<()>;
 }
 
 pub trait HttpServiceFactory: Send + Sized + 'static {
@@ -82,11 +80,11 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
     fn start_with_uds<P: AsRef<Path>>(self, path: P) -> io::Result<coroutine::JoinHandle<()>> {
         use std::fs;
         use std::os::fd::AsRawFd;
-        
+
         let path = path.as_ref();
         // Remove existing socket file if it exists
         let _ = fs::remove_file(path);
-        
+
         let listener = UnixListener::bind(path)?;
         go!(
             coroutine::Builder::new().name("UdsServerFac".to_owned()),
@@ -96,13 +94,12 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
                     let id = stream.as_raw_fd() as usize;
                     let service = self.new_service(id);
                     let builder = may::coroutine::Builder::new().id(id);
-                    go!(
-                        builder,
-                        move || if let Err(e) = each_connection_loop_uds(&mut stream, service) {
-                            error!("service err = {e:?}");
-                            stream.shutdown(std::net::Shutdown::Both).ok();
-                        }
-                    )
+                    go!(builder, move || if let Err(e) =
+                        each_connection_loop_uds(&mut stream, service)
+                    {
+                        error!("service err = {e:?}");
+                        stream.shutdown(std::net::Shutdown::Both).ok();
+                    })
                     .unwrap();
                 }
             }
@@ -170,7 +167,10 @@ pub(crate) fn reserve_buf(buf: &mut BytesMut) {
 pub struct HttpServer<T>(pub T);
 
 #[cfg(unix)]
-fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) -> io::Result<()> {
+fn each_connection_loop_generic<S: HttpStream, T: HttpService>(
+    stream: &mut S,
+    mut service: T,
+) -> io::Result<()> {
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
     let mut body_buf = BytesMut::with_capacity(4096);
@@ -194,8 +194,6 @@ fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) 
                     response::encode_error(e, &mut rsp_buf);
                 }
             }
-            // here need to use no_delay tcp option
-            // nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
         }
 
         // write out the responses
@@ -205,43 +203,16 @@ fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) 
             stream.wait_io();
         }
     }
+}
+
+#[cfg(unix)]
+fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, service: T) -> io::Result<()> {
+    each_connection_loop_generic(stream, service)
 }
 
 #[cfg(unix)]
-fn each_connection_loop_uds<T: HttpService>(stream: &mut UnixStream, mut service: T) -> io::Result<()> {
-    let mut req_buf = BytesMut::with_capacity(BUF_LEN);
-    let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
-    let mut body_buf = BytesMut::with_capacity(4096);
-
-    loop {
-        // Use the same non-blocking pattern as TCP since UnixStream exposes inner_mut()
-        let read_blocked = nonblock_read(stream.inner_mut(), &mut req_buf)?;
-
-        // prepare the requests, we should make sure the request is fully read
-        loop {
-            let mut headers = [MaybeUninit::uninit(); request::MAX_HEADERS];
-            let req = match request::decode(&mut headers, &mut req_buf, stream)? {
-                Some(req) => req,
-                None => break,
-            };
-            reserve_buf(&mut rsp_buf);
-            let mut rsp = Response::new(&mut body_buf);
-            match service.call(req, &mut rsp) {
-                Ok(()) => response::encode(rsp, &mut rsp_buf),
-                Err(e) => {
-                    eprintln!("service err = {e:?}");
-                    response::encode_error(e, &mut rsp_buf);
-                }
-            }
-        }
-
-        // write out the responses
-        nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
-
-        if read_blocked {
-            stream.wait_io();
-        }
-    }
+fn each_connection_loop_uds<T: HttpService>(stream: &mut UnixStream, service: T) -> io::Result<()> {
+    each_connection_loop_generic(stream, service)
 }
 
 #[cfg(not(unix))]
@@ -308,18 +279,18 @@ impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
             }
         )
     }
-    
+
     /// Spawns the http service, binding to the given Unix Domain Socket path
     /// return a coroutine that you can cancel it when need to stop the service
     #[cfg(unix)]
     pub fn start_with_uds<P: AsRef<Path>>(self, path: P) -> io::Result<coroutine::JoinHandle<()>> {
         use std::fs;
-        use std::os::fd::AsRawFd;
         
+
         let path = path.as_ref();
         // Remove existing socket file if it exists
         let _ = fs::remove_file(path);
-        
+
         let listener = UnixListener::bind(path)?;
         let service = self.0;
         go!(
@@ -337,5 +308,48 @@ impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
                 }
             }
         )
+    }
+}
+
+#[cfg(unix)]
+pub trait HttpStream: Read + Write + Send {
+    type Inner: Read + Write;
+    fn inner_mut(&mut self) -> &mut Self::Inner;
+    fn wait_io(&self);
+}
+
+// Implementation for TcpStream
+#[cfg(unix)]
+impl HttpStream for TcpStream {
+    type Inner = std::net::TcpStream;
+
+    fn inner_mut(&mut self) -> &mut Self::Inner {
+        // Calls may::net::TcpStream's inner_mut() method
+        // This gives access to the underlying std::net::TcpStream
+        self.inner_mut()
+    }
+
+    fn wait_io(&self) {
+        // Calls may::net::TcpStream's wait_io() method
+        // This yields to the coroutine scheduler when I/O would block
+        may::io::WaitIo::wait_io(self);
+    }
+}
+
+// Implementation for UnixStream
+#[cfg(unix)]
+impl HttpStream for UnixStream {
+    type Inner = std::os::unix::net::UnixStream;
+
+    fn inner_mut(&mut self) -> &mut Self::Inner {
+        // Calls may::os::unix::net::UnixStream's inner_mut() method
+        // This gives access to the underlying std::os::unix::net::UnixStream
+        self.inner_mut()
+    }
+
+    fn wait_io(&self) {
+        // Calls may::os::unix::net::UnixStream's wait_io() method
+        // This yields to the coroutine scheduler when I/O would block
+        may::io::WaitIo::wait_io(self);
     }
 }
