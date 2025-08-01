@@ -31,9 +31,9 @@ macro_rules! t_c {
 
 /// the http service trait
 /// user code should supply a type that impl the `call` method for the http server
-/// S is the stream type (`TcpStream` or `UnixStream`)
+/// S is the stream type (TcpStream or UnixStream)
 pub trait HttpService {
-    fn call<S>(&mut self, req: Request<S>, rsp: &mut Response) -> io::Result<()>;
+    fn call<S: Read>(&mut self, req: Request<S>, rsp: &mut Response) -> io::Result<()>;
 }
 
 pub trait HttpServiceFactory: Send + Sized + 'static {
@@ -285,7 +285,7 @@ impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
     #[cfg(unix)]
     pub fn start_with_uds<P: AsRef<Path>>(self, path: P) -> io::Result<coroutine::JoinHandle<()>> {
         use std::fs;
-        
+        use std::os::fd::AsRawFd;
 
         let path = path.as_ref();
         // Remove existing socket file if it exists

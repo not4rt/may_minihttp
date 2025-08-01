@@ -102,23 +102,28 @@ impl<'buf, 'stream, S> Request<'buf, '_, 'stream, S>
 where
     S: Read,
 {
-    #[must_use] pub fn method(&self) -> &str {
+    #[must_use]
+    pub fn method(&self) -> &str {
         self.req.method.unwrap()
     }
 
-    #[must_use] pub fn path(&self) -> &str {
+    #[must_use]
+    pub fn path(&self) -> &str {
         self.req.path.unwrap()
     }
 
-    #[must_use] pub fn version(&self) -> u8 {
+    #[must_use]
+    pub fn version(&self) -> u8 {
         self.req.version.unwrap()
     }
 
-    #[must_use] pub fn headers(&self) -> &[httparse::Header<'_>] {
+    #[must_use]
+    pub fn headers(&self) -> &[httparse::Header<'_>] {
         self.req.headers
     }
 
-    #[must_use] pub fn body(self) -> BodyReader<'buf, 'stream, S> {
+    #[must_use]
+    pub fn body(self) -> BodyReader<'buf, 'stream, S> {
         BodyReader {
             body_limit: self.content_length(),
             total_read: 0,
